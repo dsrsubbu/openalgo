@@ -88,6 +88,7 @@ frontend/dist/**/*.gz.tmp
 
 # frontend/dist/ is built by CI/CD pipeline
 frontend/dist/
+/frontend/dist
 frontend/.cache/
 *.local
 
