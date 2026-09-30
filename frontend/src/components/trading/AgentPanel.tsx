@@ -104,13 +104,23 @@ export interface AgentPanelProps {
 export function AgentPanel({ getChartContext, onChartCommand, onCaptureChart }: AgentPanelProps) {
   const { configured, loading } = useAgentConfigured()
   const threadRef = useRef<HTMLDivElement>(null)
+  const chartContextRef = useRef<ReturnType<typeof getChartContext>>(null)
+
+  // Refresh chart context immediately when the panel opens, to ensure we have
+  // the latest chart state (symbol, interval, bars) available at send time.
+  // This prevents "no chart context" errors when the user types immediately.
+  const getChartContextWithCache = useCallback(() => {
+    const context = getChartContext()
+    chartContextRef.current = context
+    return context
+  }, [getChartContext])
 
   const { messages, running, error, send, stop, reset } = useAgentStream({
     surface: 'chart',
     // Never `tradingEnabled`. The chart surface is offered no order tools, and
     // asking for them here would be asking for a capability this panel has no
     // approval flow for. An order request belongs on the chat page.
-    getChartContext,
+    getChartContext: getChartContextWithCache,
     onChartCommand,
   })
 
@@ -168,8 +178,8 @@ export function AgentPanel({ getChartContext, onChartCommand, onCaptureChart }: 
                 <Bot className="h-8 w-8 text-muted-foreground/50" aria-hidden />
                 <p className="text-sm font-medium">Ask about this chart</p>
                 <p className="text-xs leading-relaxed text-muted-foreground">
-                  It reads the symbol, interval and bars you are looking at, and it can mark up the
-                  chart. It places no orders here.
+                  Load a symbol to get started. It reads the symbol, interval and bars you are looking
+                  at, and it can mark up the chart. It places no orders here.
                 </p>
               </div>
             ) : (
