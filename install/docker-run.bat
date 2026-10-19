@@ -40,7 +40,7 @@ REM XTS Brokers that require market data credentials
 set XTS_BROKERS=fivepaisaxts,compositedge,ibulls,iifl,jainamxts,rmoney,wisdom
 
 REM Valid brokers list
-set VALID_BROKERS=fivepaisa,fivepaisaxts,aliceblue,angel,arrow,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,hdfcsecurities,hdfcsky,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,tradesmart,upstox,wisdom,zebu,zerodha
+set VALID_BROKERS=fivepaisa,fivepaisaxts,aliceblue,angel,arrow,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,hdfcsecurities,hdfcsky,ibulls,iifl,iiflcapital,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,rupeezy,samco,shoonya,tradejini,tradesmart,upstox,wisdom,zebu,zerodha
 
 REM Banner
 echo.
@@ -159,7 +159,7 @@ echo   Valid brokers:
 echo   fivepaisa, fivepaisaxts, aliceblue, angel, arrow, compositedge,
 echo   definedge, deltaexchange, dhan, dhan_sandbox, firstock, flattrade, fyers,
 echo   groww, hdfcsecurities, hdfcsky, ibulls, iifl, iiflcapital, indmoney, jainamxts, kotak, motilal,
-echo   mstock, nubra, paytm, pocketful, rmoney, samco, shoonya,
+echo   mstock, nubra, paytm, pocketful, rmoney, rupeezy, samco, shoonya,
 echo   tradejini, tradesmart, upstox, wisdom, zebu, zerodha
 echo.
 
@@ -318,7 +318,7 @@ if errorlevel 1 (
 )
 
 REM Stop and remove existing container if exists
-docker stop %CONTAINER% >nul 2>&1
+docker stop -t 45 %CONTAINER% >nul 2>&1
 docker rm %CONTAINER% >nul 2>&1
 
 REM Calculate dynamic resource limits based on available RAM.
@@ -384,6 +384,7 @@ REM Run container
 echo [INFO] Starting container...
 docker run -d ^
     --name %CONTAINER% ^
+    --stop-timeout 45 ^
     --shm-size=%SHM_SIZE_MB%m ^
     -p 5000:5000 ^
     -p 8765:8765 ^
@@ -434,14 +435,14 @@ goto end
 
 :stop
 echo [INFO] Stopping OpenAlgo...
-docker stop %CONTAINER% >nul 2>&1
+docker stop -t 45 %CONTAINER% >nul 2>&1
 docker rm %CONTAINER% >nul 2>&1
 echo [OK] OpenAlgo stopped.
 goto end
 
 :restart
 echo [INFO] Restarting OpenAlgo...
-docker stop %CONTAINER% >nul 2>&1
+docker stop -t 45 %CONTAINER% >nul 2>&1
 docker rm %CONTAINER% >nul 2>&1
 echo [OK] OpenAlgo stopped.
 echo.

@@ -17,7 +17,7 @@ single broker session and WebSocket feed:
 | Python Strategy Host | `/python` | In-browser editor; scripts scheduled on IST times, run as isolated subprocesses with live logs |
 | Flow (No-Code Builder) | `/flow` | Node graph: market data to indicators to conditions to order execution |
 | Strategy Module & RMS | `/strategy` | Multi-leg options strategies with end-to-end risk management, plus a signal-driven mode for per-alert TradingView trading. Two kinds share one engine: `batch` enters and exits every leg together, `signal` moves one leg per alert. Risk rules come from the shared `services/risk/` core. See [`docs/prompt/strategy_rms_documentation.md`](docs/prompt/strategy_rms_documentation.md). |
-| Options & Portfolio Suite | `/tools` | 18 tools. Options analytics (Option Chain, Greeks, OI Tracker, Max Pain, Vol Surface, GEX, IV Smile, Straddle, Arbitrage, ...) plus portfolio and investment tools (Portfolio Backtester, SIP Backtester, Portfolio Analyzer, Strategy Builder). The registry is `frontend/src/lib/tools.ts` — the home page derives its count from it, so add a tool there and both pages update. |
+| Options & Portfolio Suite | `/tools` | 19 tools. Options analytics (Option Chain, Greeks, OI Tracker, Max Pain, Vol Surface, GEX, Strike Profile (GEX and DEX by strike and expiry), IV Smile, Straddle, Arbitrage, ...) plus portfolio and investment tools (Portfolio Backtester, SIP Backtester, Portfolio Analyzer, Strategy Builder). The registry is `frontend/src/lib/tools.ts`: the home page derives its count from it, so add a tool there and both pages update. |
 | Charting Terminal | `/trading` | Line-based chart trading, powered by the `openalgo-charts` package |
 | Scalping Terminal | `/scalping` | Keyboard-driven options scalping (`blueprints/scalping.py` resolves underlying/expiry/strike; index options only — NRML/MIS, never CNC) |
 
@@ -47,6 +47,7 @@ Detailed procedures live in `.claude/skills/` and load on demand:
 - **`broker-integration`** — adding or modifying a broker plugin
 - **`chart-indicator`** — building a custom indicator for the `/trading` chart. These are plain JavaScript descriptors on `openalgo-charts`, unrelated to the Python `openalgo.ta` indicators used from strategies and scanners.
 - **`openscript`**: writing a study or strategy in OpenScript, the language compiled by `openalgo-script` and run from `strategies/openscript/`. A third unrelated thing called an indicator: not the JavaScript chart descriptors above, and not `openalgo.ta`.
+- **`grokbot-setup`** — understanding and running OpenAlgo inside Grok Bot on its own Linux box (start from its `references/openalgo-knowledge.md`): uv install, `.env` and broker credentials, headless start, manual or automated daily broker login (Indian brokers only), weekly upgrade, and the static IP limit for Live orders
 
 ## Security and Deployment Model
 
@@ -60,20 +61,61 @@ Detailed procedures live in `.claude/skills/` and load on demand:
 
 ## Runtime Constraints
 
-### Eventlet + Gunicorn (production)
+### Two production workers: eventlet (default) and gthread (opt-in)
 
-Production (Ubuntu direct and Docker) runs `gunicorn --worker-class eventlet -w 1`:
+Production (Ubuntu direct and Docker) runs gunicorn with one worker process.
+Which worker class it uses is chosen per install by one `.env` key,
+`OPENALGO_WORKER_CLASS`:
 
-- **No `asyncio`.** Eventlet monkey-patches the stdlib and is incompatible with `asyncio.run()`, `async`/`await`, and `asyncio.get_event_loop()`. Async work must use eventlet green threads or run on a separate real OS thread — see `telegram_bot_service.py:_render_plotly_png` for the pattern.
-- **Single worker (`-w 1`) is mandatory.** Flask-SocketIO state is in-process and cannot be shared across workers.
-- **`threading.local()` maps to green threads**, which is why `scoped_session` works correctly under eventlet.
+- **eventlet is the default and stays the default.** An install that has not set the key runs `gunicorn --worker-class eventlet -w 1` exactly as before, and an update never rewrites its systemd unit, nginx configuration or dependencies. About 4,75,000 installs run this way, so every change must be behaviour-neutral under eventlet.
+- **gthread is opt-in.** `OPENALGO_WORKER_CLASS = 'gthread'` plus `install/switch-worker.sh` (Ubuntu) or a container restart (Docker) starts gunicorn through the repo launcher `install/openalgo-gunicorn.sh` with a fixed pool of 64 threads. It is the only new setting; the thread count is not configurable. Switched systemd units reference the launcher path forever, so never move or rename it. The trader-facing guide is [`docs/gthread/README.md`](docs/gthread/README.md).
+- **Single worker (`-w 1`) is mandatory under both.** Flask-SocketIO state is in-process and cannot be shared across workers.
+- **Code must be correct under eventlet, gthread and the dev server.** A race fix (a lock, a compare-and-set claim, a single flight) may apply in every mode, but the quiet path must stay unchanged. Anything a trader could notice (refusing or timing out a request, capping streams, bounding a broker queue wait) is gated on `utils.runtime.gthread_active()`.
+- **Use the shared helpers instead of writing new ones:** `utils/runtime.py` answers which worker is running (never test `"eventlet" in sys.modules`); `utils/real_threading.py`; `utils/thread_safe_cache.py` (`LockedTTLCache`, never a bare `cachetools.TTLCache`, and a test fails on new ones); `utils/lazy.py`; `utils/keyed_locks.py`; `utils/stream_registry.py` (every long-lived response is admitted and released through it); `utils/shutdown.py`; `utils/db_sessions.py`; `utils/broker_backpressure.py`; `utils/smart_order_guard.py`; `extensions.emit_from_any_thread`.
+- **No `asyncio` in request code while eventlet is the default.** Eventlet monkey-patches the stdlib and is incompatible with `asyncio.run()`, `async`/`await`, and `asyncio.get_event_loop()`. Async work runs on a real OS thread with its own loop (`services/websocket_client.py` and `telegram_bot_service.py:_render_plotly_png` are the patterns). `async def` views wait until eventlet is removed.
+- **`threading.local()` maps to green threads under eventlet and to real threads under gthread.** `scoped_session` works in both, but a gthread pool thread outlives its request, so the session teardown layers are what stop state leaking from one request into the next.
+- **gunicorn 26 removes the eventlet worker** (its own deprecation notice in 25.3.0 says so), which is why the pin `gunicorn>=25.0,<26` stays while eventlet is the default.
 
 ### Development server differs
 
-`uv run app.py` uses standard threading, not eventlet. Code must work in both.
-`asyncio` works fine on the dev server and **breaks in production** — this is the
-single most common way a change passes locally and fails on deploy. SQLite
-locking is also stricter on Windows.
+`uv run app.py` uses standard threading: neither eventlet nor gunicorn, and it
+ignores `OPENALGO_WORKER_CLASS`. Code must work in all three. `asyncio` works
+fine on the dev server and **breaks under eventlet**. That is the single most
+common way a change passes locally and fails on deploy. SQLite locking is also
+stricter on Windows.
+
+### The gthread suite passes before every commit and pull request
+
+The `gthread-migration` CI job runs every `test/test_gthread_*.py` file under a
+real gunicorn on Linux. Most of those files skip on Windows, so a green
+`uv run pytest` on a Windows checkout says nothing about them. Before committing
+or raising a pull request, run the job's own command on Linux or in WSL (in a
+copy on the Linux filesystem, not under `/mnt/c`):
+
+```bash
+uv sync
+uv pip install "gunicorn>=25.0,<26" "eventlet==0.41.2"
+.venv/bin/python -m pytest test/test_gthread_*.py -o addopts="" --timeout=120 -rs
+```
+
+- **Main stays green.** Check `gh run list --workflow CI --branch main` before
+  starting. A red `gthread-migration` on main is fixed first, in its own pull
+  request, before new work lands on top of it.
+- **A flaky test is fixed, never re-run into green.** Find the race and write a
+  test that reproduces it. The one that broke main after #2217: the control case
+  in `test_gthread_deploy_shutdown.py` lets the arbiter SIGKILL the worker, and
+  the kill landed between the hook creating its marker file and writing to it.
+  The empty file made `split()[0]` raise `IndexError`.
+- **Read a file a killed process writes as possibly cut off.** A marker, pid or
+  log file can exist and still be empty or end mid-line. Count only complete
+  lines (`_first_mark` in that file) and treat an empty file as "not reached".
+- **A thread-leak check names the threads it owns.** The suite shares one
+  interpreter, and importing `blueprints.python_strategy` starts APScheduler,
+  whose default executor is an unnamed pool (`ThreadPoolExecutor-0_0`) that
+  starts a thread whenever a scheduled job fires. Counting every new
+  `ThreadPoolExecutor-` thread made `test_gthread_brokers_a_quote_paths.py`
+  fail at random. Record the pools the code under test builds and check their
+  own threads, or match a `thread_name_prefix` only that code uses.
 
 ## Invariants — do not break these
 
@@ -87,7 +129,7 @@ and the cache-invalidation publisher (`database/cache_invalidation.py`).
 
 - **Never make a publisher `bind()`.** ZMQ allows many PUBs to connect to one bound SUB, so publishers across processes share one fixed port with no contention.
 - **`ZMQ_PORT` is fixed by config and never drifts.** No port scan, no `5555 -> 5556` fallback, no runtime mutation of `os.environ["ZMQ_PORT"]`. `install-multi.sh` gives each instance its own `ZMQ_PORT` (`5555 + i-1`) and each stays put.
-- **Why:** under gunicorn+eventlet the proxy runs *out of process* (a subprocess via `install.sh`, or a separate `python -m websocket_proxy.server` on Docker `start.sh`) while the cache-invalidation publisher runs inside gunicorn. If a publisher binds, the two processes race for the port; the loser silently slides to the next port while the SUB stays put, so **`subscribe` succeeds but no ticks are delivered**. Works on the single-process dev server, broken only under eventlet — historically very hard to spot. Broker-agnostic.
+- **Why:** under gunicorn, with either worker, the proxy runs *out of process* (a subprocess started by the worker, chosen by `resolve_proxy_mode()` in `websocket_proxy/app_integration.py`, or a separate `python -m websocket_proxy.server` on Docker `start.sh`) while the cache-invalidation publisher runs inside gunicorn. If a publisher binds, the two processes race for the port; the loser silently slides to the next port while the SUB stays put, so **`subscribe` succeeds but no ticks are delivered**. Works on the single-process dev server, broken only under eventlet — historically very hard to spot. Broker-agnostic.
 
 ### Multi-session login must not tear down the shared broker feed
 
@@ -182,7 +224,8 @@ handlers in `blueprints/traffic.py` and `blueprints/security.py`.
 
 ### Nothing may block or be blocked across the eventlet boundary
 
-Production is `gunicorn --worker-class eventlet -w 1`. Eventlet monkey-patches
+These rules govern the default worker, `gunicorn --worker-class eventlet -w 1`,
+and so every install that has not opted in to gthread. Eventlet monkey-patches
 the stdlib **before the app is imported**, so `threading.Lock`, `RLock`,
 `Event`, `Condition` and `queue.Queue` are all **green**: they belong to the hub
 and can only pass a waiter from one greenlet to another. A plain
@@ -219,11 +262,19 @@ arrived in 0.3s still cost the caller its full 10s timeout.
 - **Keep a real lock's critical section to in-memory bookkeeping.** A greenlet waiting on one blocks the hub, so copy what you need out of the dict and do the database and network work after the release.
 - **Never wait on a C-served timeout.** `PRAGMA busy_timeout` was the worst case: SQLite waits inside C, so the greenlet holding the write lock could never be scheduled to commit, and the wait could only ever end in "database is locked". A holder needing 0.5s produced a 16s failure. `database/__init__.py` now waits 100ms in SQLite and retries from Python.
 - **Never hand a result across with `run_coroutine_threadsafe`.** Use `WebSocketClient._run_on_loop`: a real `Event` the loop thread sets, polled by the caller. One boolean is the only thing that crosses.
+- **Reach green code from a real thread through `utils.real_threading.run_on_hub` or `submit_to_hub`**, and emit over Socket.IO with `extensions.emit_from_any_thread`. Both run inline when eventlet is not patched, so the same call is correct under gthread and on the dev server.
 - **Logging counts.** `logging.Handler` builds its lock in `__init__`, which happens after monkey-patching, so it is green, and every real thread in this project logs. `utils/logging.py` patches `Handler.createLock` on the class so ours and third-party handlers all get a real lock. The give-away that this has broken is `AttributeError: 'StreamHandler' object has no attribute 'lock'` appearing on unrelated requests, hours before the hard crash.
 
-**What is exempt.** Under eventlet `app.py` starts the websocket proxy as a
+**What is exempt.** Under gunicorn `app.py` starts the websocket proxy as a
 **child process**, so everything in `websocket_proxy/` and `broker/*/streaming/`
 runs unpatched and its `threading.Lock` is already real. Do not "fix" those.
+
+**Under gthread the hazard changes shape.** Every primitive is real, so A and B
+above cannot happen. What eventlet hid instead is preemption: a check-then-act
+or read-modify-write on shared state with no I/O in between was accidentally
+atomic under eventlet, and under real threads it interleaves. Claim under the
+lock that checks, publish caches as whole generations, and prove a race with a
+barrier-synchronised test that fails on the old code (`test/test_gthread_*.py`).
 
 **It cannot be caught locally.** `uv run app.py` never patches anything, so every
 one of these behaves correctly on the dev server whatever the primitive is made
@@ -279,9 +330,47 @@ User indicators live in `strategies/indicators/*.js` (gitignored, mirroring
 (`frontend/src/lib/trading/customIndicators.ts`).
 
 - **Never bundle them.** `frontend/dist/` is built by CI from what is committed, so a bundled indicator would need committing first and the next `git pull` would erase it. Runtime loading keeps them outside the build: no Node.js, no rebuild, untouched by upgrades.
-- **They register after the built-ins**, so a custom id that collides with one of the 105 built-ins overrides it.
+- **They register after the built-ins**, so a custom id that collides with one of the 112 built-ins overrides it.
 - **They are not sandboxed.** An indicator runs on the app origin with the logged-in session and can reach `/api/v1/`. That matches the trust model of the Python strategy host, which already runs arbitrary user code, but it means an indicator from an untrusted source is as dangerous as any script.
 - Use the **`chart-indicator`** skill to write one. It validates against the real library and refuses to install a file that errors.
+
+### /trading is a full-screen terminal
+
+Traders compare /trading with the best charting terminals they use, so its
+finish is held to that bar: borrow their craft (density, crispness, one icon
+weight, quiet states), never their layout, grouping or wording, and **no brand or
+product names anywhere in /trading**: code, comments, class names, tooltips and
+copy describe things generically.
+
+- **No app navbar on /trading.** The terminal takes the whole viewport. Its one
+  toolbar band carries a Dashboard link at the left and the account controls at
+  the right: broker badge, Live or Analyze badge, mode switch, theme toggle and
+  profile menu. Both the navbar and the terminal render the same
+  `components/layout/AccountControls.tsx`; never fork that logic into the
+  terminal, or mode switching and its warning toasts drift apart.
+- **Those four (Dashboard, mode switch, theme toggle, profile menu) are visible
+  at every width**, outside the toolbar's scrolling part. Everything else gives
+  way first: labels collapse to icons with tooltips on narrower screens, and the
+  row must fit at 1366 px. `Trading.test.tsx` pins the four by accessible name.
+- **Every glyph comes from the chart engine**, through the generated
+  `chromeIcons.ts` and `drawingToolMetadata.ts` and the `ChromeIcon` component in
+  `lib/trading/glyphs.tsx`, at the engine's line weight. The toolbar never imports
+  `openalgo-charts/draw` for an icon: that would load the drawing renderer with
+  the toolbar. Where the engine has no glyph, the app icon kept in its place is
+  drawn at the same weight.
+- **The drawing rail follows the engine's reference host rail**
+  (`examples/yfinance/src/rail.js` in openalgo-charts): glyph sizes, group carets
+  and flyouts, held-tool and magnet dots, the pinned controls block, and the fold
+  with its tab at the chart's lower left (`oa-trading-rail-folded` in local
+  storage). Change both together, or the two drift.
+- **Three looks, one source.** Live light, live dark and analyzer (the violet
+  accent) all come from the app's theme tokens through
+  `lib/trading/chartTheme.ts` and the tokens in `index.css`; no component carries
+  a palette of its own. A visual change is checked in all three, and the theme
+  toggle stays disabled in analyzer, as it is in the navbar.
+- **The chart the toolbar drives** is chosen from the layout menu ("Selected
+  chart"), and the focused pane's frame shows the accent. Keep the toolbar's
+  `data-toolbar-pane` attribute: the browser harness reads it.
 
 ### Bumping openalgo-charts also updates the chart-indicator skill
 
@@ -295,7 +384,23 @@ change, not two.**
 cd frontend && npm install openalgo-charts@<version> --save-exact
 node .claude/skills/chart-indicator/generate-api-index.mjs   # regenerates the index
 node .claude/skills/chart-indicator/coverage.mjs             # must print COVERAGE COMPLETE
+node scripts/generate-drawing-tools.mjs                       # rail glyphs and names, from the installed draw tier
+node scripts/generate-chrome-icons.mjs                        # toolbar and rail chrome glyphs
 ```
+
+The two generators write `src/lib/trading/drawingToolMetadata.ts` and
+`src/lib/trading/chromeIcons.ts`; CI runs both with `--check`, so a bump that
+changes a glyph and skips them fails the build. Never edit either file by hand,
+and never run a formatter over them: `frontend/biome.json` leaves them out, because
+the check compares the generator's exact output and a reformatted file fails it.
+
+A bump that changes what /trading loads also runs the browser harness that lives
+in the openalgo-charts repo: `node scripts/check-openalgo-compat.mjs --frontend
+<worktree>/frontend --browser <chromium|firefox|webkit> --navigation true` (14
+checks). It needs a linked `git worktree` of this repo with `node_modules`
+copied, not linked. On Windows copy it with `robocopy <src> <dst> /E /XJ`: without
+`/XJ` robocopy follows the junctions inside `node_modules` and copies the same
+trees over and over (9 GB instead of 730 MB), which once filled the system drive.
 
 Then read the upstream changelog for the range you skipped and update the prose
 by hand: **Recent changes worth knowing** in `SKILL.md`, the *What arrived
@@ -512,6 +617,12 @@ schema forever and the change silently never reaches the ~290k live deployments.
 - **Backfill from the data, not from a default.** A new column defaulted
   uniformly is usually wrong for existing rows; derive each row's value from
   what the row already says.
+- **A revised seed file needs a migration too.** `data/qtyfreeze.csv` and the
+  other seed data load only into an empty table, so a new value reaches new
+  installs and nobody else. Ship a migration that updates the rows, guarded on
+  every value OpenAlgo shipped or the exchange published before, and leave an
+  empty table to the seed: one inserted row stops the seed from running.
+  `upgrade/migrate_qty_freeze_oct_2026.py` is the pattern.
 - **SQLite limits shape the approach.** It cannot alter a `CHECK` constraint or
   add a `UNIQUE` column in place: rebuild the table (see
   `migrate_sandbox_trigger_pending.py`) or add a partial unique index instead.
@@ -547,7 +658,9 @@ have cost to write it down.
 
 **No icons or emojis anywhere** — source, comments, log messages, commit
 messages, PR descriptions, changelogs, release notes, or any generated text
-including drafts for Discord or Telegram. Use plain text labels.
+including drafts for Discord or Telegram. Use plain text labels. That covers the
+automated attribution line at the end of a PR description too: keep its text and
+link, drop the emoji in front of it.
 
 ### The ChatGPT subscription model list is ours to maintain
 
@@ -557,8 +670,10 @@ app. Everything about the agent's provider catalogue is read live from LiteLLM
 precisely so a package bump brings new models with it. This provider is the one
 exception, and it needs a person.
 
-**The symptom, if you do not know this.** LiteLLM's registry carries ten
-`chatgpt/*` entries, newest `gpt-5.4`, while the backend serves more. A model
+**The symptom, if you do not know this.** LiteLLM's registry lags the backend:
+at 1.104.0 its bundled map carries fourteen `chatgpt/*` entries, newest the
+`gpt-5.6` variants, while the backend serves more. The map LiteLLM fetches from
+GitHub at import is usually ahead of the bundled one, so check both. A model
 absent from that registry has no `mode`, so LiteLLM routes it through the
 chat-completions bridge instead of `/v1/responses`. The request never reaches
 the API: it lands on a Cloudflare interstitial and returns
@@ -628,6 +743,7 @@ to `main` after every successful push.
 - **Production servers and backend-only contributors need no Node.js.** A plain `git pull` from `main` brings the latest UI. This is the canonical upgrade path.
 - **React developers** run `cd frontend && npm install && npm run build` (or `npm run dev`) locally, since the local `.gitignore` will not track their output. Build only — tests run in CI.
 - **Feature branches** CI has not built may carry stale or missing `dist/`. Build locally or rebase onto recent `main`.
+- **A local build on a branch cut from `main` rewrites tracked files under `frontend/dist/`.** Never stage them (`git add -A -- . ':!frontend/dist'`); `git checkout -- frontend/dist` restores them. A user testing a branch with `uv run app.py` needs that local build, and the commit still carries source only.
 
 Config lives in `.env` (copy from `.sample.env`); `VALID_BROKERS` gates which
 broker plugins load, and plugins are discovered at startup only.
